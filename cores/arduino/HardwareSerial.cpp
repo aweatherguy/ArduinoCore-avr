@@ -189,12 +189,12 @@ int HardwareSerial::available(void)
   }
   tail = _rx_buffer_tail;
 #if IS_PWR_TWO( SERIAL_RX_BUFFER_SIZE )
-  return (head - tail) & (SERIAL_RX_BUFFER_SIZE - 1);
+  return (rx_buffer_index_t)((head - tail) & (SERIAL_RX_BUFFER_SIZE - 1));
 #else
   if (tail > head)
-    return (SERIAL_RX_BUFFER_SIZE + head - tail);
+    return (rx_buffer_index_t)(SERIAL_RX_BUFFER_SIZE + head - tail);
   else
-    return head - tail;
+    return (rx_buffer_index_t)(head - tail);
 #endif
 }
 
