@@ -92,15 +92,24 @@ void serialEventRun(void)
 #define RX_BUFFER_ATOMIC
 #endif
 
+#define IS_PWR_TWO(n) ( ( ( (n) - 1 ) & (n) ) == 0 )
 
 // Actual interrupt handlers //////////////////////////////////////////////////////////////
 
 void HardwareSerial::_tx_udr_empty_irq(void)
 {
+  tx_buffer_index_t head = _tx_buffer_head;
+  tx_buffer_index_t tail = _tx_buffer_tail;
+
   // If interrupts are enabled, there must be more data in the output
   // buffer. Send the next byte
-  unsigned char c = _tx_buffer[_tx_buffer_tail];
-  _tx_buffer_tail = (_tx_buffer_tail + 1) % SERIAL_TX_BUFFER_SIZE;
+  unsigned char c = _tx_buffer[tail];
+#if IS_PWR_TWO( SERIAL_TX_BUFFER_SIZE )
+  tail = (tail + 1) & (SERIAL_TX_BUFFER_SIZE - 1);
+#else
+  tail += 1;
+  if (tail >= SERIAL_TX_BUFFER_SIZE) tail = 0;
+#endif
 
   *_udr = c;
 
@@ -111,10 +120,11 @@ void HardwareSerial::_tx_udr_empty_irq(void)
 
   *_ucsra = ((*_ucsra) & ((1 << U2X0) | (1 << MPCM0))) | (1 << TXC0);
 
-  if (_tx_buffer_head == _tx_buffer_tail) {
+  if (head == tail) {
     // Buffer empty, so disable interrupts
     cbi(*_ucsrb, UDRIE0);
   }
+  _tx_buffer_tail = tail;
 }
 
 // Public Methods //////////////////////////////////////////////////////////////
@@ -173,40 +183,59 @@ void HardwareSerial::end()
 int HardwareSerial::available(void)
 {
   rx_buffer_index_t head;
+  rx_buffer_index_t tail;
   RX_BUFFER_ATOMIC {
     head = _rx_buffer_head;
   }
-  return ((unsigned int)(SERIAL_RX_BUFFER_SIZE + head - _rx_buffer_tail)) % SERIAL_RX_BUFFER_SIZE;
+  tail = _rx_buffer_tail;
+#if IS_PWR_TWO( SERIAL_RX_BUFFER_SIZE )
+  return (head - tail) & (SERIAL_RX_BUFFER_SIZE - 1);
+#else
+  if (tail > head)
+    return (SERIAL_RX_BUFFER_SIZE + head - tail);
+  else
+    return head - tail;
+#endif
 }
 
 int HardwareSerial::peek(void)
 {
   rx_buffer_index_t head;
+  rx_buffer_index_t tail;
   RX_BUFFER_ATOMIC {
     head = _rx_buffer_head;
   }
-  if (head == _rx_buffer_tail) {
+  tail = _rx_buffer_tail;
+  if (head == tail) {
     return -1;
   } else {
-    return _rx_buffer[_rx_buffer_tail];
+    return _rx_buffer[tail];
   }
 }
 
 int HardwareSerial::read(void)
 {
   rx_buffer_index_t head;
+  rx_buffer_index_t tail;
   RX_BUFFER_ATOMIC {
     head = _rx_buffer_head;
   }
+  tail = _rx_buffer_tail;
   // if the head isn't ahead of the tail, we don't have any characters
-  if (head == _rx_buffer_tail) {
+  if (head == tail) {
     return -1;
   } else {
-    unsigned char c = _rx_buffer[_rx_buffer_tail];
+    rx_buffer_index_t newTail;
+#if IS_PWR_TWO( SERIAL_RX_BUFFER_SIZE )
+    newTail = (tail + 1) & (SERIAL_RX_BUFFER_SIZE - 1);
+#else
+    newTail = tail + 1;
+    if (newTail >= SERIAL_RX_BUFFER_SIZE) newTail = 0;
+#endif
 	RX_BUFFER_ATOMIC {
-      _rx_buffer_tail = (rx_buffer_index_t)(_rx_buffer_tail + 1) % SERIAL_RX_BUFFER_SIZE;
+      _rx_buffer_tail = newTail;
     }
-    return c;
+    return _rx_buffer[tail];
   }
 }
 
@@ -219,8 +248,12 @@ int HardwareSerial::availableForWrite(void)
     head = _tx_buffer_head;
     tail = _tx_buffer_tail;
   }
-  if (head >= tail) return SERIAL_TX_BUFFER_SIZE - 1 - head + tail;
-  return tail - head - 1;
+#if IS_PWR_TWO( SERIAL_TX_BUFFER_SIZE )
+  return (tx_buffer_index_t)((tail - head - 1) & (SERIAL_TX_BUFFER_SIZE - 1));
+#else
+  if (head >= tail) return (SERIAL_TX_BUFFER_SIZE - 1) - head + tail;
+  return (tx_buffer_index_t)(tail - head - 1);
+#endif
 }
 
 void HardwareSerial::flush()
@@ -246,11 +279,16 @@ void HardwareSerial::flush()
 size_t HardwareSerial::write(uint8_t c)
 {
   _written = true;
+  tx_buffer_index_t head = _tx_buffer_head;
+  tx_buffer_index_t tail;
+  TX_BUFFER_ATOMIC {
+    tail = _tx_buffer_tail;
+  }
   // If the buffer and the data register is empty, just write the byte
   // to the data register and be done. This shortcut helps
   // significantly improve the effective datarate at high (>
   // 500kbit/s) bitrates, where interrupt overhead becomes a slowdown.
-  if (_tx_buffer_head == _tx_buffer_tail && bit_is_set(*_ucsra, UDRE0)) {
+  if (head == tail && bit_is_set(*_ucsra, UDRE0)) {
     // If TXC is cleared before writing UDR and the previous byte
     // completes before writing to UDR, TXC will be set but a byte
     // is still being transmitted causing flush() to return too soon.
@@ -265,30 +303,45 @@ size_t HardwareSerial::write(uint8_t c)
     }
     return 1;
   }
-  tx_buffer_index_t i = (_tx_buffer_head + 1) % SERIAL_TX_BUFFER_SIZE;
-	
+  _tx_buffer[head] = c;
+  tx_buffer_index_t newHead;
+#if IS_PWR_TWO
+  newHead = (head + 1) & (SERIAL_TX_BUFFER_SIZE - 1);
+#else
+  newHead = head + 1;
+  if (newHead >= SERIAL_TX_BUFFER_SIZE) newHead = 0;
+#endif
   // If the output buffer is full, there's nothing for it other than to 
   // wait for the interrupt handler to empty it a bit
-  while (i == _tx_buffer_tail) {
-    if (bit_is_clear(SREG, SREG_I)) {
-      // Interrupts are disabled, so we'll have to poll the data
-      // register empty flag ourselves. If it is set, pretend an
-      // interrupt has happened and call the handler to free up
-      // space for us.
-      if(bit_is_set(*_ucsra, UDRE0))
-	_tx_udr_empty_irq();
-    } else {
-      // nop, the interrupt handler will free up space for us
-    }
+  // OTOH, if interrupts are enabled, the local copy of tail must be refreshed each pass through the
+  // loop because it is updated by the UDRE ISR.
+  if (newHead == tail)
+  {
+      if (bit_is_clear(SREG, SREG_I)) {
+          // Interrupts are disabled, so we'll have to poll the data
+          // register empty flag ourselves. If it is set, pretend an
+          // interrupt has happened and call the handler to free up
+          // space for us. On the plus side, we don't need to worry 
+          // about making atomic accesses to the tail pointer.
+          while (newHead == _rx_buffer_tail) {
+              if(bit_is_set(*_ucsra, UDRE0)) _tx_udr_empty_irq();
+          }
+      }
+      else
+      {
+          while (newHead == tail)
+          {
+              TX_BUFFER_ATOMIC {
+                  tail = _rx_buffer_tail;
+              }
+          }
+      }
   }
-
-  _tx_buffer[_tx_buffer_head] = c;
-
   // make atomic to prevent execution of ISR between setting the
   // head pointer and setting the interrupt flag resulting in buffer
   // retransmission
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    _tx_buffer_head = i;
+    _tx_buffer_head = newHead;
     sbi(*_ucsrb, UDRIE0);
   }
   
