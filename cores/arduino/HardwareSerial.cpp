@@ -1,17 +1,14 @@
 /*
   HardwareSerial.cpp - Hardware serial library for Wiring
   Copyright (c) 2006 Nicholas Zambetti.  All right reserved.
-
   This library is free software; you can redistribute it and/or
   modify it under the terms of the GNU Lesser General Public
   License as published by the Free Software Foundation; either
   version 2.1 of the License, or (at your option) any later version.
-
   This library is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
   Lesser General Public License for more details.
-
   You should have received a copy of the GNU Lesser General Public
   License along with this library; if not, write to the Free Software
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
@@ -77,12 +74,24 @@ void serialEventRun(void)
 #endif
 }
 
-// macro to guard critical sections when needed for large TX buffer sizes
+// Macro to guard critical sections for large transmit buffer sizes
+// Reads from the transmit buffer tail pointer and writes to either head or tail pointer
+// should be atomic in this case
 #if (SERIAL_TX_BUFFER_SIZE>256)
 #define TX_BUFFER_ATOMIC ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
 #else
 #define TX_BUFFER_ATOMIC
 #endif
+
+// Macro to guard critical sections for large receive buffer sizes
+// Reads from the receive buffer head pointer and writes to either head or tail pointer
+// should be atomic in this case
+#if (SERIAL_RX_BUFFER_SIZE>256)
+#define RX_BUFFER_ATOMIC ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+#else
+#define RX_BUFFER_ATOMIC
+#endif
+
 
 // Actual interrupt handlers //////////////////////////////////////////////////////////////
 
@@ -100,11 +109,7 @@ void HardwareSerial::_tx_udr_empty_irq(void)
   // actually got written. Other r/w bits are preserved, and zeroes
   // written to the rest.
 
-#ifdef MPCM0
   *_ucsra = ((*_ucsra) & ((1 << U2X0) | (1 << MPCM0))) | (1 << TXC0);
-#else
-  *_ucsra = ((*_ucsra) & ((1 << U2X0) | (1 << TXC0)));
-#endif
 
   if (_tx_buffer_head == _tx_buffer_tail) {
     // Buffer empty, so disable interrupts
@@ -160,17 +165,27 @@ void HardwareSerial::end()
   cbi(*_ucsrb, UDRIE0);
   
   // clear any received data
+  RX_BUFFER_ATOMIC {
   _rx_buffer_head = _rx_buffer_tail;
+  }
 }
 
 int HardwareSerial::available(void)
 {
-  return ((unsigned int)(SERIAL_RX_BUFFER_SIZE + _rx_buffer_head - _rx_buffer_tail)) % SERIAL_RX_BUFFER_SIZE;
+  rx_buffer_index_t head;
+  RX_BUFFER_ATOMIC {
+    head = _rx_buffer_head;
+  }
+  return ((unsigned int)(SERIAL_RX_BUFFER_SIZE + head - _rx_buffer_tail)) % SERIAL_RX_BUFFER_SIZE;
 }
 
 int HardwareSerial::peek(void)
 {
-  if (_rx_buffer_head == _rx_buffer_tail) {
+  rx_buffer_index_t head;
+  RX_BUFFER_ATOMIC {
+    head = _rx_buffer_head;
+  }
+  if (head == _rx_buffer_tail) {
     return -1;
   } else {
     return _rx_buffer[_rx_buffer_tail];
@@ -179,12 +194,18 @@ int HardwareSerial::peek(void)
 
 int HardwareSerial::read(void)
 {
+  rx_buffer_index_t head;
+  RX_BUFFER_ATOMIC {
+    head = _rx_buffer_head;
+  }
   // if the head isn't ahead of the tail, we don't have any characters
-  if (_rx_buffer_head == _rx_buffer_tail) {
+  if (head == _rx_buffer_tail) {
     return -1;
   } else {
     unsigned char c = _rx_buffer[_rx_buffer_tail];
-    _rx_buffer_tail = (rx_buffer_index_t)(_rx_buffer_tail + 1) % SERIAL_RX_BUFFER_SIZE;
+	RX_BUFFER_ATOMIC {
+      _rx_buffer_tail = (rx_buffer_index_t)(_rx_buffer_tail + 1) % SERIAL_RX_BUFFER_SIZE;
+    }
     return c;
   }
 }
@@ -240,11 +261,7 @@ size_t HardwareSerial::write(uint8_t c)
     // be cleared when no bytes are left, causing flush() to hang
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
       *_udr = c;
-#ifdef MPCM0
       *_ucsra = ((*_ucsra) & ((1 << U2X0) | (1 << MPCM0))) | (1 << TXC0);
-#else
-      *_ucsra = ((*_ucsra) & ((1 << U2X0) | (1 << TXC0)));
-#endif
     }
     return 1;
   }
